@@ -31,14 +31,17 @@ for (const suffix of ["PUBLIC_PORT", "STATE_DIR", "WORKSPACE_DIR", "GATEWAY_TOKE
 const PORT = Number.parseInt(process.env.PORT ?? process.env.OPENCLAW_PUBLIC_PORT ?? "3000", 10);
 
 // State/workspace
-// OpenClaw defaults to ~/.openclaw.
+// Default to the Railway persistent volume so config survives redeploys even
+// when OPENCLAW_STATE_DIR / OPENCLAW_WORKSPACE_DIR are not explicitly set.
+// railway.toml sets these variables for template deploys, but GitHub-connected
+// services do not inherit [variables] defaults from railway.toml automatically.
 const STATE_DIR =
   process.env.OPENCLAW_STATE_DIR?.trim() ||
-  path.join(os.homedir(), ".openclaw");
+  "/data/.openclaw";
 
 const WORKSPACE_DIR =
   process.env.OPENCLAW_WORKSPACE_DIR?.trim() ||
-  path.join(STATE_DIR, "workspace");
+  "/data/workspace";
 
 // Protect /setup with a user-provided password.
 const SETUP_PASSWORD = process.env.SETUP_PASSWORD?.trim();
