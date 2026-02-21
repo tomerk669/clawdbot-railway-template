@@ -70,6 +70,52 @@ function resolveGatewayToken() {
 const OPENCLAW_GATEWAY_TOKEN = resolveGatewayToken();
 process.env.OPENCLAW_GATEWAY_TOKEN = OPENCLAW_GATEWAY_TOKEN;
 
+// ---------------------------------------------------------------------------
+// Rate limiting for /setup Basic Auth failures.
+// HTTP Basic Auth has no built-in lockout, making it trivially brute-forceable
+// without an explicit rate limiter at the application layer.
+// ---------------------------------------------------------------------------
+const SETUP_RATE_LIMIT_MAX_ATTEMPTS = 5;          // failures allowed per window
+const SETUP_RATE_LIMIT_WINDOW_MS = 60_000;        // 1-minute sliding window
+const SETUP_RATE_LIMIT_LOCKOUT_MS = 15 * 60_000;  // 15-minute lockout after limit
+const setupRateLimitMap = new Map();               // ip → { attempts: number[], lockedUntil?: number }
+
+function resolveClientIp(req) {
+  // Railway (and most reverse proxies) prepend the real client IP to X-Forwarded-For.
+  // The leftmost entry is the original client.
+  const fwd = req.headers["x-forwarded-for"];
+  if (fwd) return fwd.split(",")[0].trim();
+  return req.socket?.remoteAddress ?? "unknown";
+}
+
+function checkSetupRateLimit(ip) {
+  const now = Date.now();
+  const entry = setupRateLimitMap.get(ip);
+  if (!entry) return { allowed: true };
+  if (entry.lockedUntil) {
+    if (now < entry.lockedUntil) return { allowed: false, retryAfterMs: entry.lockedUntil - now };
+    // Lockout expired — reset.
+    setupRateLimitMap.delete(ip);
+    return { allowed: true };
+  }
+  const cutoff = now - SETUP_RATE_LIMIT_WINDOW_MS;
+  entry.attempts = entry.attempts.filter((ts) => ts > cutoff);
+  return { allowed: entry.attempts.length < SETUP_RATE_LIMIT_MAX_ATTEMPTS };
+}
+
+function recordSetupAuthFailure(ip) {
+  const now = Date.now();
+  let entry = setupRateLimitMap.get(ip);
+  if (!entry) { entry = { attempts: [] }; setupRateLimitMap.set(ip, entry); }
+  if (entry.lockedUntil && now < entry.lockedUntil) return; // already locked
+  const cutoff = now - SETUP_RATE_LIMIT_WINDOW_MS;
+  entry.attempts = entry.attempts.filter((ts) => ts > cutoff);
+  entry.attempts.push(now);
+  if (entry.attempts.length >= SETUP_RATE_LIMIT_MAX_ATTEMPTS) {
+    entry.lockedUntil = now + SETUP_RATE_LIMIT_LOCKOUT_MS;
+  }
+}
+
 // Where the gateway will listen internally (we proxy to it).
 const INTERNAL_GATEWAY_PORT = Number.parseInt(process.env.INTERNAL_GATEWAY_PORT ?? "18789", 10);
 const INTERNAL_GATEWAY_HOST = process.env.INTERNAL_GATEWAY_HOST ?? "127.0.0.1";
@@ -279,6 +325,16 @@ function requireSetupAuth(req, res, next) {
       .send("SETUP_PASSWORD is not set. Set it in Railway Variables before using /setup.");
   }
 
+  const ip = resolveClientIp(req);
+
+  // Rate limit check — must happen before decoding credentials to block enumeration.
+  const rl = checkSetupRateLimit(ip);
+  if (!rl.allowed) {
+    const retryAfterSec = Math.ceil((rl.retryAfterMs ?? SETUP_RATE_LIMIT_LOCKOUT_MS) / 1000);
+    res.set("Retry-After", String(retryAfterSec));
+    return res.status(429).type("text/plain").send("Too many failed attempts. Try again later.");
+  }
+
   const header = req.headers.authorization || "";
   const [scheme, encoded] = header.split(" ");
   if (scheme !== "Basic" || !encoded) {
@@ -288,10 +344,18 @@ function requireSetupAuth(req, res, next) {
   const decoded = Buffer.from(encoded, "base64").toString("utf8");
   const idx = decoded.indexOf(":");
   const password = idx >= 0 ? decoded.slice(idx + 1) : "";
-  if (password !== SETUP_PASSWORD) {
+
+  // Constant-time comparison prevents timing side-channel attacks.
+  // Hash both sides first so buffers are always the same length (32 bytes),
+  // which is required by timingSafeEqual.
+  const expectedBuf = crypto.createHash("sha256").update(SETUP_PASSWORD).digest();
+  const actualBuf = crypto.createHash("sha256").update(password).digest();
+  if (!crypto.timingSafeEqual(expectedBuf, actualBuf)) {
+    recordSetupAuthFailure(ip);
     res.set("WWW-Authenticate", 'Basic realm="OpenClaw Setup"');
     return res.status(401).send("Invalid password");
   }
+
   return next();
 }
 
@@ -326,7 +390,8 @@ async function probeGateway() {
 }
 
 // Public health endpoint (no auth) so Railway can probe without /setup.
-// Keep this free of secrets.
+// Intentionally minimal: internal paths, gateway address, and error details are
+// omitted to avoid fingerprinting and information leakage to unauthenticated callers.
 app.get("/healthz", async (_req, res) => {
   let gatewayReachable = false;
   if (isConfigured()) {
@@ -339,17 +404,9 @@ app.get("/healthz", async (_req, res) => {
 
   res.json({
     ok: true,
-    wrapper: {
-      configured: isConfigured(),
-      stateDir: STATE_DIR,
-      workspaceDir: WORKSPACE_DIR,
-    },
+    configured: isConfigured(),
     gateway: {
-      target: GATEWAY_TARGET,
       reachable: gatewayReachable,
-      lastError: lastGatewayError,
-      lastExit: lastGatewayExit,
-      lastDoctorAt,
     },
   });
 });
@@ -753,6 +810,19 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
     await runCmd(
       OPENCLAW_NODE,
       clawArgs(["config", "set", "--json", "gateway.trustedProxies", JSON.stringify(["127.0.0.1"]) ]),
+    );
+
+    // Enable the gateway auth rate limiter (off by default in openclaw).
+    // trustedProxies above ensures the limiter tracks real client IPs via X-Forwarded-For
+    // rather than exempting all requests as loopback.
+    // 5 attempts / 60s window → 15-minute lockout, matching the wrapper's /setup limit.
+    await runCmd(
+      OPENCLAW_NODE,
+      clawArgs(["config", "set", "--json", "gateway.auth.rateLimit", JSON.stringify({
+        maxAttempts: 5,
+        windowMs: 60_000,
+        lockoutMs: 15 * 60_000,
+      })]),
     );
 
     // Optional: configure a custom OpenAI-compatible provider (base URL) for advanced users.
