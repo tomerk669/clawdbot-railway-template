@@ -112,6 +112,13 @@
       var ver = j.openclawVersion ? (' | ' + j.openclawVersion) : '';
       setStatus((j.configured ? 'Configured' : 'Not configured - run setup below') + ver);
 
+      // Update the "Open OpenClaw UI" link to include the gateway token so the
+      // Control UI automatically authenticates on first open.
+      var openUiLink = document.getElementById('openUiLink');
+      if (openUiLink && j.token) {
+        openUiLink.href = '/openclaw?token=' + encodeURIComponent(j.token);
+      }
+
       if (statusDetailsEl) {
         var parts = [];
         parts.push('Gateway target: ' + (j.gatewayTarget || '(unknown)'));

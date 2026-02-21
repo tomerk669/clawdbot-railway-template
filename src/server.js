@@ -444,7 +444,7 @@ app.get("/setup", requireSetupAuth, (_req, res) => {
     <div id="status">Loading...</div>
     <div id="statusDetails" class="muted" style="margin-top:0.5rem"></div>
     <div style="margin-top: 0.75rem">
-      <a href="/openclaw" target="_blank">Open OpenClaw UI</a>
+      <a id="openUiLink" href="/openclaw" target="_blank">Open OpenClaw UI</a>
       &nbsp;|&nbsp;
       <a href="/setup/export" target="_blank">Download backup (.tar.gz)</a>
     </div>
@@ -645,6 +645,9 @@ app.get("/setup/api/status", requireSetupAuth, async (_req, res) => {
     openclawVersion: version.output.trim(),
     channelsAddHelp: channelsHelp.output,
     authGroups: AUTH_GROUPS,
+    // Expose the gateway token so the setup page can build a pre-authed link to the Control UI.
+    // This endpoint is already protected by requireSetupAuth (SETUP_PASSWORD + rate limiting).
+    token: OPENCLAW_GATEWAY_TOKEN,
   });
 });
 
